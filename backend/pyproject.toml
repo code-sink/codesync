@@ -1,0 +1,15 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "merge3>=0.0.16",
+    "whatthepatch>=1.0.7",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
