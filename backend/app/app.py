@@ -6,12 +6,15 @@ from .StateTracker.RepoManager import RepoManager
 from .StateTracker.FileCache import File
 from .StateTracker.FileStates import PatchEvent
 from .utls import parse_update
+from app.routers import auth
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 repo_manager = RepoManager()
 
+# Include routers
+app.include_router(auth.router)
 
 @app.websocket("/developer-updates")
 async def developer_updates(websocket: WebSocket):
