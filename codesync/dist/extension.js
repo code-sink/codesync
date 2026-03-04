@@ -41,15 +41,11 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.activate = activate;
 exports.deactivate = deactivate;
-// The module 'vscode' contains the VS Code extensibility API
-// Import the module and reference it with the alias vscode in your code below
 const vscode = __importStar(__webpack_require__(1));
 const auth_1 = __webpack_require__(2);
 const fileWatcher_1 = __webpack_require__(3);
 const git_1 = __webpack_require__(4);
 let statusBar;
-// This method is called when your extension is activated
-// Your extension is activated the very first time the command is executed
 async function activate(context) {
     console.log('CodeSync: activate() called');
     statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
@@ -63,6 +59,7 @@ async function activate(context) {
         vscode.window.showWarningMessage('CodeSync: GitHub auth failed');
         return;
     }
+    console.log('Authentication complete');
     await (0, git_1.monitorGitRepository)((repo) => {
         statusBar.text = `$(git-branch) CodeSync: ${repo.branch}`;
         vscode.window.showInformationMessage(`CodeSync: Monitoring ${repo.remoteUrl}`);
@@ -81,7 +78,6 @@ async function activate(context) {
     });
     context.subscriptions.push(mockCommand);
 }
-// This method is called when your extension is deactivated
 function deactivate() {
     console.log('CodeSync deactivated');
 }

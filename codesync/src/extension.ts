@@ -1,5 +1,3 @@
-// The module 'vscode' contains the VS Code extensibility API
-// Import the module and reference it with the alias vscode in your code below
 import * as vscode from 'vscode';
 import { AuthManager } from './auth';
 import { FileWatcher } from './fileWatcher';
@@ -7,8 +5,6 @@ import { monitorGitRepository } from './git';
 
 let statusBar: vscode.StatusBarItem; 
 
-// This method is called when your extension is activated
-// Your extension is activated the very first time the command is executed
 export async function activate(context: vscode.ExtensionContext) {
 	console.log('CodeSync: activate() called');
 
@@ -24,6 +20,7 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('CodeSync: GitHub auth failed');
         return;
     }
+    console.log('Authentication complete'); 
 
     await monitorGitRepository(
 		(repo) => {
@@ -52,7 +49,6 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(mockCommand);
 }
 
-// This method is called when your extension is deactivated
 export function deactivate() {
 	console.log('CodeSync deactivated');
 }
