@@ -1,23 +1,48 @@
 import json
 import logging
 import time
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from .StateTracker.RepoManager import RepoManager
 from .StateTracker.FileCache import File
 from .StateTracker.FileStates import PatchEvent
 from .utls import parse_update
-from app.routers import auth
+from app.routes import auth
+from app.routes import user_repos
+from app.routes import webhooks
+from .db.db import create_all_tables
+from app.middleware.auth_middleware import AuthMiddleware, get_current_user_ws
 
 logger = logging.getLogger(__name__)
-
-app = FastAPI()
 repo_manager = RepoManager()
 
-# Include routers
+app = FastAPI()
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000"
+    ],  
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Centralized auth middleware: validates token + attaches user to request.state
+app.add_middleware(AuthMiddleware)
+
+@app.on_event("startup")
+async def startup_event():
+    await create_all_tables()
+
 app.include_router(auth.router)
+app.include_router(user_repos.router)
+app.include_router(webhooks.router)
 
 @app.websocket("/developer-updates")
-async def developer_updates(websocket: WebSocket):
+async def developer_updates(websocket: WebSocket, user = Depends(get_current_user_ws)):
     """
     Single persistent WebSocket connection per developer session.
 

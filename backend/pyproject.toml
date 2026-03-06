@@ -5,7 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "httpx>=0.28.1",
     "merge3>=0.0.16",
+    "pyjwt[cryptography]>=2.11.0",
     "whatthepatch>=1.0.7",
 ]
 
