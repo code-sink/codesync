@@ -1,9 +1,12 @@
-from fastapi import APIRouter, Request
+import logging
+
+from fastapi import APIRouter, Request, HTTPException
 from sqlalchemy.orm import selectinload
 
 from app.db.db import AsyncSessionLocal
 from app.db.models.models import User
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/user", tags=["User"])
 
 
@@ -42,7 +45,6 @@ async def list_repos(request: Request):
                 "default_branch": repo.repo_default_branch,
                 "private": repo.repository_is_private,
                 "updated_at": repo.repository_updated_at.isoformat() if repo.repository_updated_at else None,
-                "created_at": repo.repository_created_at.isoformat() if repo.repository_created_at else None,
             }
             for repo in repos
         ],
@@ -75,8 +77,35 @@ async def get_repo_details(repo_id: int, request: Request, branch_id: int = None
         repo = result.scalar_one_or_none()
 
         if not repo:
-            from fastapi import HTTPException
             raise HTTPException(status_code=404, detail="Repository not found or access denied")
+
+        # --- Lazy initialization ---
+        # If the repo has no branches yet, we haven't fully populated it.
+        # Trigger full initialization now (blocks until done so the response is complete).
+        branch_ids_check = await db.execute(
+            select(Branch.branch_id).where(Branch.repository_id == repo.repository_id).limit(1)
+        )
+        if branch_ids_check.scalar_one_or_none() is None:
+            # Need the user's GitHub token to call the API
+            from sqlalchemy import select as sa_select
+            token_result = await db.execute(
+                sa_select(User.user_github_token).where(User.user_id == current_user.user_id)
+            )
+            token = token_result.scalar_one_or_none()
+            if token:
+                from app.routes.webhooks import _ensure_repo_initialized
+                initialized = await _ensure_repo_initialized(repo, token, db)
+                if initialized:
+                    await db.commit()
+                    # Reload repo with fresh branch data
+                    result2 = await db.execute(
+                        select(Repository)
+                        .where(Repository.repository_id == repo_id)
+                        .options(selectinload(Repository.branches))
+                    )
+                    repo = result2.scalar_one_or_none() or repo
+            else:
+                logger.warning(f"Cannot lazy-init repo {repo_id}: no token for user {current_user.user_id}")
 
         # Determine which branch to load files for
         selected_branch = None

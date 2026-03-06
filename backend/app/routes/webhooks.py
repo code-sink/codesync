@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -78,6 +79,35 @@ async def _grant_access(db: AsyncSession, user_id: int, repo_id: int):
         await db.execute(UserAccess.insert().values(user_id=user_id, repo_id=repo_id))
 
 
+async def _onboard_single_repo(repo_data: dict, installation_id: int, token: str, grant_user_id: int | None = None):
+    """Upsert a single repo's basic metadata and grant access.
+    Full initialization (branches, files, collaborators) is done lazily on first access.
+    """
+    async with AsyncSessionLocal() as db:
+        repo = await _upsert_repo(db, repo_data, installation_id, token)
+        if grant_user_id is not None:
+            await _grant_access(db, grant_user_id, repo.repository_id)
+        await db.commit()
+
+
+async def _ensure_repo_initialized(repo: Repository, token: str, db: AsyncSession) -> bool:
+    """Check if the repo has been fully initialized (has branches). If not, run full
+    population now. Returns True if just initialized, False if already was.
+    Uses presence of Branch records as a proxy for initialization status.
+    """
+    branch_check = await db.execute(
+        select(Branch.branch_id).where(Branch.repository_id == repo.repository_id).limit(1)
+    )
+    if branch_check.scalar_one_or_none() is not None:
+        return False  # already initialized
+
+    logger.info(f"Lazy-initializing repo {repo.repo_name}...")
+    await _sync_collaborators(db, repo, token)
+    await _populate_repo_contents(token, repo.repo_name, repo, db)
+    await db.flush()
+    return True
+
+
 async def _populate_repo_contents(token: str, repo_full_name: str, repo: Repository, db: AsyncSession):
     """
     Fetch all branches for a repo, then for each branch fetch the file tree,
@@ -90,17 +120,32 @@ async def _populate_repo_contents(token: str, repo_full_name: str, repo: Reposit
 
     async with httpx.AsyncClient() as client:
         # Fetch branches
+
         branches_resp = await client.get(
             f"https://api.github.com/repos/{repo_full_name}/branches",
             headers=headers,
             params={"per_page": 100},
         )
         if branches_resp.status_code != 200:
-            logger.error(f"Failed to fetch branches for {repo_full_name}: {branches_resp.status_code}")
+            logger.debug(f"Failed to fetch branches for {repo_full_name}: {branches_resp.status_code}")
             return
 
         for branch_data in branches_resp.json():
             branch_name = branch_data["name"]
+
+            # Guard against race condition: if this repo was deleted by a concurrent
+            # removal webhook (e.g. admin switched from "all repos" to specific repos)
+            # while we're still populating, stop immediately.
+            repo_check = await db.execute(
+                select(Repository.repository_id).where(
+                    Repository.repository_id == repo.repository_id
+                )
+            )
+            if repo_check.scalar_one_or_none() is None:
+                logger.warning(
+                    f"Repo {repo_full_name} was deleted mid-populate, aborting."
+                )
+                return
 
             # Check if branch already exists
             result = await db.execute(
@@ -148,7 +193,7 @@ async def _populate_repo_contents(token: str, repo_full_name: str, repo: Reposit
                 params={"recursive": "true"},
             )
             if tree_resp.status_code != 200:
-                logger.warning(f"Failed to fetch tree for {repo_full_name}:{branch_name}")
+                logger.debug(f"Failed to fetch tree for {repo_full_name}:{branch_name}")
                 continue
 
             tree = tree_resp.json().get("tree", [])
@@ -250,29 +295,20 @@ async def _handle_installation_created(payload: dict):
             )
             return
 
-        # Upsert repos, sync collaborators, populate files
-        for repo_data in repos:
-            repo = await _upsert_repo(db, repo_data, installation_id, token)
-            await _sync_collaborators(db, repo, token)
-            await _populate_repo_contents(token, repo.repo_name, repo, db)
-
-        # Grant access to the sender (the installer)
         sender_user = await _upsert_user_by_github_id(
             db, str(sender["id"]), sender.get("login"), sender.get("avatar_url")
         )
-        for repo_data in repos:
-            result = await db.execute(
-                select(Repository).where(Repository.repo_github_id == str(repo_data["id"]))
-            )
-            repo = result.scalar_one_or_none()
-            if repo:
-                await _grant_access(db, sender_user.user_id, repo.repository_id)
-
+        sender_user_id = sender_user.user_id
         await db.commit()
-        logger.info(
-            f"Installation {installation_id} processed: "
-            f"{len(repos)} repo(s) connected for {sender_login}"
-        )
+
+    # Basic metadata upsert only — full initialization happens lazily on first access
+    for repo_data in repos:
+        await _onboard_single_repo(repo_data, installation_id, token, grant_user_id=sender_user_id)
+
+    logger.info(f"Installation {installation_id}: {len(repos)} repo(s) registered for {sender_login} (lazy init)")
+
+    # Reconcile DB with GitHub's authoritative repo list for this installation
+    await _reconcile_installation(installation_id, token)
 
 
 async def _handle_repos_added(payload: dict):
@@ -287,23 +323,112 @@ async def _handle_repos_added(payload: dict):
             logger.error(f"No stored token for sender {sender.get('id')} — cannot process repos_added")
             return
 
-        for repo_data in repos:
-            repo = await _upsert_repo(db, repo_data, installation_id, token)
-            await _sync_collaborators(db, repo, token)
-            await _populate_repo_contents(token, repo.repo_name, repo, db)
-
         sender_user = await _upsert_user_by_github_id(
             db, str(sender["id"]), sender.get("login"), sender.get("avatar_url")
         )
-        for repo_data in repos:
-            result = await db.execute(
-                select(Repository).where(Repository.repo_github_id == str(repo_data["id"]))
+        sender_user_id = sender_user.user_id
+        await db.commit()
+
+    # Basic metadata upsert only — full initialization happens lazily on first access
+    for repo_data in repos:
+        await _onboard_single_repo(repo_data, installation_id, token, grant_user_id=sender_user_id)
+
+    # Reconcile DB with GitHub's authoritative repo list for this installation
+    await _reconcile_installation(installation_id, token)
+
+
+async def _reconcile_installation(installation_id: int, token: str):
+    """
+    Query GitHub for the authoritative list of repos this installation
+    currently has access to, then sync our DB:
+      - delete repos in DB that GitHub no longer includes
+      - add repos that GitHub has but aren't in our DB yet
+
+    Called after every installation-related event so the DB stays in sync
+    regardless of race conditions or out-of-order webhook delivery.
+    """
+    from sqlalchemy import delete as sa_delete
+    from app.db.models.models import Branch, File, Edit
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+
+    # Fetch the real repo list from GitHub
+    github_repo_ids: set[str] = set()
+    github_repos: list[dict] = []
+    async with httpx.AsyncClient() as client:
+        page = 1
+        while True:
+            resp = await client.get(
+                f"https://api.github.com/user/installations/{installation_id}/repositories",
+                headers=headers,
+                params={"per_page": 100, "page": page},
             )
-            repo = result.scalar_one_or_none()
-            if repo:
-                await _grant_access(db, sender_user.user_id, repo.repository_id)
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Reconcile: failed to fetch repos for installation {installation_id}: "
+                    f"{resp.status_code} — skipping reconciliation"
+                )
+                return
+            data = resp.json()
+            batch = data.get("repositories", [])
+            if not batch:
+                break
+            for r in batch:
+                github_repo_ids.add(str(r["id"]))
+                github_repos.append(r)
+            page += 1
+
+    logger.info(
+        f"Reconcile installation {installation_id}: "
+        f"GitHub reports {len(github_repo_ids)} repo(s)"
+    )
+
+    async with AsyncSessionLocal() as db:
+        # Find repos in our DB for this installation
+        db_result = await db.execute(
+            select(Repository).where(Repository.installation_id == installation_id)
+        )
+        db_repos = db_result.scalars().all()
+        db_repo_ids = {r.repo_github_id for r in db_repos}
+
+        # --- Delete repos in DB that GitHub no longer includes ---
+        stale_ids = db_repo_ids - github_repo_ids
+        for repo in db_repos:
+            if repo.repo_github_id not in stale_ids:
+                continue
+            logger.info(f"Reconcile: removing stale repo {repo.repo_name}")
+            await db.execute(UserAccess.delete().where(UserAccess.c.repo_id == repo.repository_id))
+            branch_res = await db.execute(
+                select(Branch.branch_id).where(Branch.repository_id == repo.repository_id)
+            )
+            branch_ids = branch_res.scalars().all()
+            if branch_ids:
+                file_res = await db.execute(
+                    select(File.file_id).where(File.branch_id.in_(branch_ids))
+                )
+                file_ids = file_res.scalars().all()
+                if file_ids:
+                    await db.execute(sa_delete(Edit).where(Edit.file_id.in_(file_ids)))
+                await db.execute(sa_delete(File).where(File.branch_id.in_(branch_ids)))
+                await db.execute(sa_delete(Branch).where(Branch.repository_id == repo.repository_id))
+            await db.execute(sa_delete(Repository).where(Repository.repository_id == repo.repository_id))
 
         await db.commit()
+
+    # --- Add repos GitHub has that aren't in our DB ---
+    new_repo_ids = github_repo_ids - db_repo_ids
+    if new_repo_ids:
+        new_repos = [r for r in github_repos if str(r["id"]) in new_repo_ids]
+        logger.info(f"Reconcile: adding {len(new_repos)} new repo(s)")
+        async with AsyncSessionLocal() as db:
+            for repo_data in new_repos:
+                repo = await _upsert_repo(db, repo_data, installation_id, token)
+                await _sync_collaborators(db, repo, token)
+                await _populate_repo_contents(token, repo.repo_name, repo, db)
+            await db.commit()
 
 
 async def _handle_installation_deleted(payload: dict):
@@ -403,6 +528,27 @@ async def _handle_repos_removed(payload: dict):
                 logger.info(f"Fully deleted repository {repo_data.get('full_name')} from CodeSync")
         await db.commit()
 
+    # Reconcile DB with GitHub's authoritative repo list for this installation
+    installation_id = payload.get("installation", {}).get("id")
+    if installation_id:
+        async with AsyncSessionLocal() as db:
+            # Find a token for any user with access to repos under this installation
+            token_result = await db.execute(
+                select(User)
+                .join(UserAccess, User.user_id == UserAccess.c.user_id)
+                .join(Repository, Repository.repository_id == UserAccess.c.repo_id)
+                .where(
+                    Repository.installation_id == installation_id,
+                    User.user_github_token.isnot(None),
+                )
+                .limit(1)
+            )
+            user = token_result.scalar_one_or_none()
+        if user:
+            await _reconcile_installation(installation_id, user.user_github_token)
+        else:
+            logger.warning(f"Reconcile skipped for installation {installation_id}: no token available")
+
 
 async def _handle_member_removed(payload: dict):
     """A collaborator was removed from a repository on GitHub."""
@@ -457,12 +603,12 @@ async def _upsert_repo(db: AsyncSession, repo_data: dict, installation_id: int, 
         else:
             details = {}
 
-    result = await db.execute(select(Repository).where(Repository.repo_github_id == github_id))
-    repo = result.scalar_one_or_none()
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     now = datetime.now(timezone.utc)
-    if repo is None:
-        repo = Repository(
+    stmt = (
+        pg_insert(Repository)
+        .values(
             repo_github_id=github_id,
             repo_name=full_name,
             repo_description=details.get("description"),
@@ -470,22 +616,26 @@ async def _upsert_repo(db: AsyncSession, repo_data: dict, installation_id: int, 
             repo_language=details.get("language"),
             repo_default_branch=details.get("default_branch"),
             repository_is_private=details.get("private", repo_data.get("private", False)),
-            repository_created_at=now,
             repository_updated_at=now,
             installation_id=installation_id,
         )
-        db.add(repo)
-        await db.flush()
-    else:
-        repo.repo_name = full_name
-        repo.repo_description = details.get("description", repo.repo_description)
-        repo.repo_html_url = details.get("html_url", repo.repo_html_url)
-        repo.repo_language = details.get("language", repo.repo_language)
-        repo.repo_default_branch = details.get("default_branch", repo.repo_default_branch)
-        repo.repository_is_private = details.get("private", repo.repository_is_private)
-        repo.repository_updated_at = now
-        repo.installation_id = installation_id
-
+        .on_conflict_do_update(
+            index_elements=["repo_github_id"],
+            set_={
+                "repo_name": full_name,
+                "repo_description": details.get("description"),
+                "repo_html_url": details.get("html_url"),
+                "repo_language": details.get("language"),
+                "repo_default_branch": details.get("default_branch"),
+                "repository_is_private": details.get("private", repo_data.get("private", False)),
+                "repository_updated_at": now,
+                "installation_id": installation_id,
+            },
+        )
+        .returning(Repository)
+    )
+    result = await db.execute(stmt)
+    repo = result.scalar_one()
     return repo
 
 
@@ -509,7 +659,7 @@ async def _sync_collaborators(db: AsyncSession, repo: Repository, token: str):
                 params={"per_page": 100, "page": page, "affiliation": "all"},
             )
             if resp.status_code != 200:
-                logger.warning(f"Failed to fetch collaborators for {repo.repo_name}: {resp.status_code}")
+                logger.debug(f"Failed to fetch collaborators for {repo.repo_name}: {resp.status_code}")
                 break
 
             collaborators = resp.json()

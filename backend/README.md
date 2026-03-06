@@ -36,3 +36,15 @@ uv pip install -r requirements.txt
 run:
 
 uv run run.py
+
+
+To run and test the GitHub App functionality (webhooks), use smee.io to forward events to localhost.
+
+# 1. Install smee-client
+npm install --global smee-client
+
+# 2. Run the forwarder
+# This forwards webhooks from our shared channel to your local server
+smee -u https://smee.io/NyJnB4mesbF3DVAp -t http://localhost:8000
+
+Make sure your backend is running on port 8000.

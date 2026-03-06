@@ -32,7 +32,6 @@ class Repository(Base):
     repo_language = Column(String, nullable=True)
     repo_default_branch = Column(String, nullable=True)
     repository_is_private = Column(Boolean)
-    repository_created_at = Column(DateTime)
     repository_updated_at = Column(DateTime)
     installation_id = Column(Integer, nullable=True)
     
