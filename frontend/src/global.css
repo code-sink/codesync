@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+    body {
+        @apply bg-black text-white antialiased selection:bg-white selection:text-black;
+    }
+}
+
+@layer utilities {
+
+    /* Soft white glow effect */
+    .glow-soft {
+        box-shadow: 0 0 20px rgba(255, 255, 255, 0.05);
+    }
+
+    /* Stronger white glow effect on hover */
+    .glow-hover:hover {
+        box-shadow: 0 0 30px rgba(255, 255, 255, 0.15);
+    }
+
+    /* Very subtle definition instead of harsh borders */
+    .subtle-edge {
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+    }
+}
