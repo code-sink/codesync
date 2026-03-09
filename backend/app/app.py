@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 repo_manager = RepoManager()
 
 app = FastAPI()
+app.add_middleware(AuthMiddleware)
 
 # Configure CORS
 app.add_middleware(
@@ -29,9 +30,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Centralized auth middleware: validates token + attaches user to request.state
-app.add_middleware(AuthMiddleware)
 
 @app.on_event("startup")
 async def startup_event():
