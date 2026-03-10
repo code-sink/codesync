@@ -9,7 +9,7 @@ const api = axios.create({
 });
 
 export const loginWithGithub = () => {
-    window.location.href = `${BACK_URL}/auth/github`;
+    window.location.href = `${BACK_URL}auth/github`;
 };
 
 export const getUserRepos = async () => {
