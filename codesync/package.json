@@ -19,7 +19,11 @@
       },
       {
         "command": "codesync.mockNotification", 
-        "title": "Developer: Mock Notifications"
+        "title": "CodeSync: Mock Notifications"
+      },
+      {
+        "command": "codesync.testPatch",
+        "title": "CodeSync: Send Test Patch"
       }
     ]
   },
@@ -46,5 +50,8 @@
     "webpack-cli": "^6.0.1",
     "@vscode/test-cli": "^0.0.12",
     "@vscode/test-electron": "^2.5.2"
+  },
+  "dependencies": {
+    "ws": "^8.19.0"
   }
 }

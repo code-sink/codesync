@@ -20,6 +20,7 @@ IS_DEV = os.getenv("IS_DEV", "true").lower() == "true"
 _PUBLIC_PATHS = {
     "/auth/github",
     "/auth/github/callback",
+    "/auth/extension/login",
     "/auth/github/app-callback", 
     "/auth/logout",
     "/webhooks/github",

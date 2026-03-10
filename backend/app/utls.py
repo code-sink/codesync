@@ -2,6 +2,7 @@ from .StateTracker.FileStates import PatchEvent
 from .StateTracker.GitMock import GitMock
 from .StateTracker.FileCache import FileCache, File
 import re
+import time
 
 HUNK_RE = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@')
 

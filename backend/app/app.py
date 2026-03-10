@@ -112,15 +112,15 @@ async def developer_updates(websocket: WebSocket, user = Depends(get_current_use
 
             # patch_update — developer sent a code change
             if msg_type == "patch_update":
-                handle_patch_update(websocket, msg)
+                await handle_patch_update(websocket, msg)
 
             # branch_update — developer switched branches
             elif msg_type == "branch_update":
-                handle_branch_update(websocket, msg)
+                await handle_branch_update(websocket, msg)
 
             # base_commit_update — developer pulled / rebased
             elif msg_type == "base_commit_update":
-                handle_base_commit_update(websocket, msg)
+                await handle_base_commit_update(websocket, msg)
 
             #unknown message type
             else:
