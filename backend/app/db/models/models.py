@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Table
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Table, UniqueConstraint
 from sqlalchemy.orm import relationship
 from .base import Base
 
@@ -41,6 +41,9 @@ class Repository(Base):
 
 class Branch(Base):
     __tablename__ = "Branch"
+    __table_args__ = (
+        UniqueConstraint("repository_id", "branch_name", name="uq_branch_repo_name"),
+    )
     branch_id = Column(Integer, primary_key=True, index=True)
     
     branch_name = Column(String)
@@ -53,6 +56,9 @@ class Branch(Base):
 
 class File(Base):
     __tablename__ = "File"
+    __table_args__ = (
+        UniqueConstraint("branch_id", "file_path", name="uq_file_branch_path"),
+    )
     file_id = Column(Integer, primary_key=True, index=True)
     file_path = Column(String, nullable=False)
     file_latest_commit = Column(String, nullable=False)

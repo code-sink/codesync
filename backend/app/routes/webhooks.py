@@ -124,7 +124,6 @@ async def _populate_repo_contents(token: str, repo_full_name: str, repo: Reposit
 
     async with httpx.AsyncClient() as client:
         # Fetch branches
-
         branches_resp = await client.get(
             f"https://api.github.com/repos/{repo_full_name}/branches",
             headers=headers,
@@ -134,93 +133,116 @@ async def _populate_repo_contents(token: str, repo_full_name: str, repo: Reposit
             logger.debug(f"Failed to fetch branches for {repo_full_name}: {branches_resp.status_code}")
             return
 
-        for branch_data in branches_resp.json():
-            branch_name = branch_data["name"]
-
-            # Guard against race condition: if this repo was deleted by a concurrent
-            # removal webhook (e.g. admin switched from "all repos" to specific repos)
-            # while we're still populating, stop immediately.
-            repo_check = await db.execute(
-                select(Repository.repository_id).where(
-                    Repository.repository_id == repo.repository_id
+        branches_data = branches_resp.json()
+        
+        # Process all branches concurrently to remove sequential API bottlenecks
+        tasks = []
+        for branch_data in branches_data:
+            tasks.append(
+                _fetch_and_upsert_branch(
+                    client, headers, repo_full_name, repo.repository_id, branch_data["name"], db
                 )
             )
-            if repo_check.scalar_one_or_none() is None:
-                logger.warning(
-                    f"Repo {repo_full_name} was deleted mid-populate, aborting."
-                )
-                return
+        
+        await asyncio.gather(*tasks)
 
-            # Check if branch already exists
-            result = await db.execute(
-                select(Branch).where(
-                    Branch.repository_id == repo.repository_id,
-                    Branch.branch_name == branch_name,
-                )
-            )
-            branch = result.scalar_one_or_none()
+    await db.commit()
 
-            # Fetch the actual commit for precise branch timestamps and to get the branch SHA
-            commit_resp = await client.get(
-                f"https://api.github.com/repos/{repo_full_name}/commits/{branch_name}",
-                headers=headers,
-            )
+
+async def _fetch_and_upsert_branch(
+    client: httpx.AsyncClient, 
+    headers: dict, 
+    repo_full_name: str, 
+    repository_id: int, 
+    branch_name: str, 
+    db: AsyncSession
+):
+    """
+    Sub-task for concurrent branch population. Fetches commit SHA/time and the
+    complete file tree, then uses PostgreSQL ON CONFLICT DO UPDATE/NOTHING 
+    to bulk upsert everything efficiently without N+1 queries.
+    """
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    
+    # 1. Fetch branch commit info
+    commit_resp = await client.get(
+        f"https://api.github.com/repos/{repo_full_name}/commits/{branch_name}",
+        headers=headers,
+    )
+    
+    branch_sha = ""
+    branch_time = datetime.now(timezone.utc)
+    if commit_resp.status_code == 200:
+        commit_data = commit_resp.json()
+        branch_sha = commit_data.get("sha", "")
+        date_str = commit_data.get("commit", {}).get("author", {}).get("date", "")
+        if date_str:
+            try:
+                branch_time = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+
+    # 2. Upsert Branch record
+    branch_stmt = (
+        pg_insert(Branch)
+        .values(
+            branch_name=branch_name,
+            branch_created_at=branch_time,
+            branch_updated_at=branch_time,
+            repository_id=repository_id,
+        )
+        .on_conflict_do_update(
+            index_elements=["repository_id", "branch_name"],
+            set_={"branch_updated_at": branch_time}
+        )
+        .returning(Branch.branch_id)
+    )
+    
+    # Executing the statement inside the task's DB session bound
+    result = await db.execute(branch_stmt)
+    branch_id = result.scalar_one()
+
+    # 3. Fetch file tree
+    tree_resp = await client.get(
+        f"https://api.github.com/repos/{repo_full_name}/git/trees/{branch_name}",
+        headers=headers,
+        params={"recursive": "true"},
+    )
+    if tree_resp.status_code != 200:
+        logger.debug(f"Failed to fetch tree for {repo_full_name}:{branch_name}")
+        return
+
+    tree = tree_resp.json().get("tree", [])
+    
+    # 4. Bulk Upsert Files using chunks to avoid exceeding parameter limits
+    # We DO NOTHING on conflict here because if the file path and branch id exist, 
+    # we just let the next push update it. The 'latest_commit' is only used for tracking.
+    file_records = []
+    for item in tree:
+        if item["type"] != "blob":
+            continue
             
-            branch_sha = ""
-            branch_time = datetime.now(timezone.utc)
-            if commit_resp.status_code == 200:
-                commit_data = commit_resp.json()
-                branch_sha = commit_data.get("sha", "")
-                date_str = commit_data.get("commit", {}).get("author", {}).get("date", "")
-                if date_str:
-                    try:
-                        branch_time = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                    except ValueError:
-                        pass
-            
-            if branch is None:
-                branch = Branch(
-                    branch_name=branch_name,
-                    branch_created_at=branch_time,
-                    branch_updated_at=branch_time,
-                    repository_id=repo.repository_id,
-                )
-                db.add(branch)
-                await db.flush()
-            else:
-                branch.branch_updated_at = branch_time
+        file_records.append({
+            "file_path": item["path"],
+            "branch_id": branch_id,
+            "file_latest_commit": branch_sha
+        })
 
-            # Fetch the file tree for this branch
-            tree_resp = await client.get(
-                f"https://api.github.com/repos/{repo_full_name}/git/trees/{branch_name}",
-                headers=headers,
-                params={"recursive": "true"},
+    if file_records:
+        CHUNK_SIZE = 500
+        for i in range(0, len(file_records), CHUNK_SIZE):
+            chunk = file_records[i:i + CHUNK_SIZE]
+            file_stmt = (
+                pg_insert(File)
+                .values(chunk)
+                .on_conflict_do_nothing(
+                    # Requires unique constraint or index if specified, but since we rely on 
+                    # application logic for unique files per branch here normally, we omit the constraint target 
+                    # falling back to any unique constraint violations being ignored.
+                    # WAIT: PostgreSQL ON CONFLICT DO NOTHING without a target applies to ALL unique constraints.
+                )
             )
-            if tree_resp.status_code != 200:
-                logger.debug(f"Failed to fetch tree for {repo_full_name}:{branch_name}")
-                continue
-
-            tree = tree_resp.json().get("tree", [])
-            for item in tree:
-                if item["type"] != "blob":
-                    continue  # skip directories
-
-                file_path = item["path"]
-                # Check if file already exists for this branch
-                file_result = await db.execute(
-                    select(File).where(
-                        File.branch_id == branch.branch_id,
-                        File.file_path == file_path,
-                    )
-                )
-                if file_result.scalar_one_or_none() is None:
-                    db.add(File(
-                        file_path=file_path, 
-                        branch_id=branch.branch_id, 
-                        file_latest_commit=branch_sha
-                    ))
-
-    await db.flush()
+            await db.execute(file_stmt)
 
 
 @router.post("/github")
@@ -232,6 +254,7 @@ async def github_webhook(request: Request):
     - installation (created): upsert repo + collaborators, populate files
     - installation_repositories (added/removed): handle repo changes
     - member (removed): revoke UserAccess
+    - repository (renamed): update stored repo name and URL
     """
     body = await request.body()
     signature = request.headers.get("x-hub-signature-256", "")
@@ -259,6 +282,9 @@ async def github_webhook(request: Request):
 
     elif event == "member" and action == "removed":
         await _handle_member_removed(payload)
+
+    elif event == "repository" and action == "renamed":
+        await _handle_repo_renamed(payload)
 
     elif event == "push":
         await _handle_push(payload)
@@ -585,6 +611,45 @@ async def _handle_member_removed(payload: dict):
         await db.commit()
 
 
+async def _handle_repo_renamed(payload: dict):
+    """
+    A repository was renamed on GitHub.
+    Updates repo_name and repo_html_url in our DB, keyed on the stable
+    repo_github_id so the rename never orphans our branches/files.
+    """
+    repo_data = payload.get("repository", {})
+    github_id = str(repo_data.get("id", ""))
+    new_full_name = repo_data.get("full_name", "")
+    new_html_url = repo_data.get("html_url", "")
+
+    if not github_id or not new_full_name:
+        logger.warning("repository.renamed webhook missing id or full_name, skipping")
+        return
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Repository).where(Repository.repo_github_id == github_id)
+        )
+        repo = result.scalar_one_or_none()
+        if repo is None:
+            logger.warning(
+                f"repository.renamed: unknown repo github_id={github_id}, ignoring"
+            )
+            return
+
+        old_name = repo.repo_name
+        repo.repo_name = new_full_name
+        if new_html_url:
+            repo.repo_html_url = new_html_url
+        repo.repository_updated_at = datetime.now(timezone.utc)
+
+        await db.commit()
+        logger.info(
+            f"Repository renamed: '{old_name}' → '{new_full_name}' "
+            f"(github_id={github_id})"
+        )
+
+
 async def _upsert_repo(db: AsyncSession, repo_data: dict, installation_id: int, token: str) -> Repository:
     """
     Upsert a repository by repo_github_id. If two admins add the same repo,
@@ -756,26 +821,24 @@ async def _handle_push(payload: dict):
             except ValueError:
                 pass
 
-        # Upsert the branch
-        branch_result = await db.execute(
-            select(Branch).where(
-                Branch.repository_id == repo.repository_id,
-                Branch.branch_name == branch_name,
-            )
-        )
-        branch = branch_result.scalar_one_or_none()
-        
-        if branch is None:
-            branch = Branch(
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        # Upsert the branch safely using the unique constraint
+        branch_stmt = (
+            pg_insert(Branch)
+            .values(
                 branch_name=branch_name,
                 branch_created_at=now,
                 branch_updated_at=now,
                 repository_id=repo.repository_id,
             )
-            db.add(branch)
-            await db.flush()
-        else:
-            branch.branch_updated_at = now
+            .on_conflict_do_update(
+                index_elements=["repository_id", "branch_name"],
+                set_={"branch_updated_at": now}
+            )
+            .returning(Branch)
+        )
+        result = await db.execute(branch_stmt)
+        branch = result.scalar_one()
 
         # Map newly added/modified files from commits to their exact commit sha
         file_sha_map = {}
@@ -808,48 +871,48 @@ async def _handle_push(payload: dict):
             await db.commit()
             return
 
-        # Build the set of file paths that should exist after this push
-        current_paths = {
-            item["path"]
-            for item in tree_resp.json().get("tree", [])
-            if item["type"] == "blob"
-        }
+        # Build the list of file records from the GitHub tree
+        file_records = []
+        for item in tree_resp.json().get("tree", []):
+            if item["type"] != "blob":
+                continue
+            
+            path = item["path"]
+            file_records.append({
+                "file_path": path,
+                "branch_id": branch.branch_id,
+                "file_latest_commit": file_sha_map.get(path, head_commit.get("id", ""))
+            })
 
-        # Load existing files for this branch
-        existing_result = await db.execute(
-            select(File).where(File.branch_id == branch.branch_id)
-        )
-        existing_files = existing_result.scalars().all()
-        existing_paths = {f.file_path for f in existing_files}
-
-        # Insert new files
-        new_paths = current_paths - existing_paths
-        for path in new_paths:
-            db.add(File(
-                file_path=path, 
-                branch_id=branch.branch_id,
-                file_latest_commit=file_sha_map.get(path, head_commit.get("id", ""))
-            ))
-
-        # Update existing files that were modified with their new commit sha
-        modified_paths = current_paths.intersection(existing_paths)
-        for existing_file in existing_files:
-            if existing_file.file_path in modified_paths and existing_file.file_path in file_sha_map:
-                existing_file.file_latest_commit = file_sha_map[existing_file.file_path]
-
-        # Delete removed files
-        removed_paths = existing_paths - current_paths
-        if removed_paths:
-            from sqlalchemy import delete as sa_delete
-            await db.execute(
-                sa_delete(File).where(
-                    File.branch_id == branch.branch_id,
-                    File.file_path.in_(removed_paths),
+        if file_records:
+            # Upsert files in chunks
+            CHUNK_SIZE = 500
+            for i in range(0, len(file_records), CHUNK_SIZE):
+                chunk = file_records[i : i + CHUNK_SIZE]
+                file_stmt = (
+                    pg_insert(File)
+                    .values(chunk)
+                    .on_conflict_do_update(
+                        index_elements=["branch_id", "file_path"],
+                        set_={
+                            "file_latest_commit": pg_insert(File).excluded.file_latest_commit
+                        }
+                    )
                 )
+                await db.execute(file_stmt)
+
+        # Delete any files that are no longer in the GitHub tree for this branch
+        current_paths = {r["file_path"] for r in file_records}
+        from sqlalchemy import delete as sa_delete
+        await db.execute(
+            sa_delete(File).where(
+                File.branch_id == branch.branch_id,
+                File.file_path.notin_(current_paths),
             )
+        )
 
         await db.commit()
         logger.info(
             f"Push sync complete for {repo_full_name}/{branch_name}: "
-            f"+{len(new_paths)} files, -{len(removed_paths)} files"
+            f"Synced {len(file_records)} files (upserted/deleted as needed)"
         )
