@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from .StateTracker.RepoManager import RepoManager
@@ -10,6 +11,7 @@ from .utls import parse_update
 from app.routes import auth
 from app.routes import user_repos
 from app.routes import webhooks
+from app.routes import activity
 from .db.db import create_all_tables
 from app.middleware.auth_middleware import AuthMiddleware, get_current_user_ws
 
@@ -33,10 +35,12 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     await create_all_tables()
+    asyncio.create_task(periodic_activity_push())
 
 app.include_router(auth.router)
 app.include_router(user_repos.router)
 app.include_router(webhooks.router)
+app.include_router(activity.router)
 
 @app.websocket("/developer-updates")
 async def developer_updates(websocket: WebSocket, user = Depends(get_current_user_ws)):
@@ -133,7 +137,39 @@ async def handle_patch_update(websocket, msg):
 
     print(result)
 
-    await websocket.send_text(json.dumps(result))
+    # publish updated snapshot to webapp clients watching this specific branch
+    sub_key = f"{file.owner}/{file.repo}:{patch.branch}"
+    if activity_feed.has_subscribers(sub_key):
+        snapshot = repo_manager.get_active_devs(file.owner, file.repo, patch.branch)
+        await activity_feed.publish(sub_key, {
+            "type": "activity_snapshot",
+            "repo": f"{file.owner}/{file.repo}",
+            "active_devs": snapshot
+        })
+
+    if result.get("outdated"):
+        response = {
+            "ok": False,
+            "type": "patch_update",
+            "error": "outdated",
+            "detail": result["details"]
+        }
+    elif result.get("conflict"):
+        response = {
+            "ok": True,
+            "type": "patch_update",
+            "conflict": True,
+            "conflicting_dev_lines": result["conflicting_dev_lines"],
+            "conflicting_branch_lines": result["conflicting_branch_lines"]
+        }
+    else:
+        response = {
+            "ok": True,
+            "type": "patch_update",
+            "conflict": False,
+        }
+
+    await websocket.send_text(json.dumps(response))
 
 async def handle_branch_update(websocket, msg):
     print(f"DEBUG: Received branch_update: {msg}")
@@ -178,3 +214,23 @@ async def handle_branch_update(websocket, msg):
             "error": "server_error",
             "detail": f"An error occurred while updating branch: {str(e)}"
         }))
+
+async def periodic_activity_push():
+    INTERVAL = 300  # 5 minutes because patch_updates trigger immediate pushes. keeping this push as a fallback for sse connection
+    while True:
+        await asyncio.sleep(INTERVAL)
+        try:
+            for sub_key, queues in list(activity_feed.subscribers.items()):
+                if not queues:
+                    continue
+                repo_key, branch = sub_key.rsplit(":", 1)
+                owner, repo_name = repo_key.split("/", 1)
+                snapshot = repo_manager.get_active_devs(owner, repo_name, branch)
+                await activity_feed.publish(sub_key, {
+                    "type": "activity_snapshot",
+                    "repo": repo_key,
+                    "branch": branch,
+                    "active_devs": snapshot
+                })
+        except Exception as e:
+            logger.error(f"periodic_activity_push error: {e}")

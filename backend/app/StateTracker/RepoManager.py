@@ -9,6 +9,7 @@ class Repo:
         self.default_branch = None
         # dev_id -> branch -> file_path -> set of interval_obj
         self.dev_intervals = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
+
         
     def clear_dev_branch(self, dev_id: str, branch_name: str):
         """Removal of all local intervals for a dev on a specific branch"""
@@ -157,3 +158,33 @@ class RepoManager:
             for ival in intervals_to_remove:
                 tree.discard(ival)
             repo.dev_intervals[dev_id][branch][file_path].clear()
+    
+    def get_active_devs(self, owner: str, repo_name: str, branch: str, inactivity_threshold: int = 900) -> dict:
+        """
+        Returns active developers grouped by branch and file.
+        Filters out devs who haven't saved in inactivity_threshold seconds (default 15 min).
+        """
+        repo_key = owner + "/" + repo_name
+        if repo_key not in self.repos:
+            return {}
+
+        repo = self.repos[repo_key]
+        now = datetime.now(timezone.utc).timestamp()
+        result = {}
+
+        for dev_id, branches in repo.dev_intervals.items():
+            if dev_id == "github-commit":
+                continue
+            files = branches.get(branch, {})
+            for file_path, intervals in files.items():
+                if not intervals:
+                    continue
+                last_save = max(ival.data.timestamp for ival in intervals)
+                if now - last_save > inactivity_threshold:
+                    continue
+                result.setdefault(branch, {}).setdefault(file_path, []).append({
+                    "dev_id": dev_id,
+                    "last_save": last_save
+                })
+
+        return result

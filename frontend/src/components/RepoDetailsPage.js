@@ -160,6 +160,31 @@ const RepoDetailsPage = () => {
     // Store the raw parsed tree
     const [fileTree, setFileTree] = useState(null);
 
+    useEffect(() => {
+        console.log('useEffect running, setting up SSE');
+        const repoId = 1; // hardcode for testing
+        const branch = 'main'; // hardcode for testing
+        
+        const eventSource = new EventSource(
+            `http://localhost:8000/activity/repos/${repoId}/stream/${branch}`,
+            { withCredentials: true } // sends the auth cookie
+        );
+
+        eventSource.onopen = () => {
+            console.log('SSE connection opened');
+        };
+
+        eventSource.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            console.log('Activity snapshot received:', data);
+        };
+
+        eventSource.onerror = (err) => {
+            console.error('SSE error:', err);
+        };
+
+        return () => eventSource.close(); // cleanup on unmount
+    }, []);
     // Fetch data
     useEffect(() => {
         setLoading(true);
