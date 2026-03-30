@@ -10,14 +10,14 @@ class ActivityFeed:
         self.subscribers: dict[str, list[asyncio.Queue]] = defaultdict(list)
 
     def subscribe(self, sub_key: str) -> asyncio.Queue:
-        """Register a new webapp client watching this repo. Returns their queue."""
+        # Register a new webapp client watching this repo. Returns their queue.
         queue = asyncio.Queue()
         self.subscribers[sub_key].append(queue)
         logger.info(f"ActivityFeed: new subscriber for {repo_key}, total={len(self.subscribers[repo_key])}")
         return queue
 
     def unsubscribe(self, sub_key: str, queue: asyncio.Queue):
-        """Remove a webapp client when their SSE connection closes."""
+        # Remove a webapp client when their SSE connection closes.
         try:
             self.subscribers[sub_key].remove(queue)
             logger.info(f"ActivityFeed: subscriber removed for {repo_key}, total={len(self.subscribers[repo_key])}")
@@ -25,7 +25,7 @@ class ActivityFeed:
             pass
 
     async def publish(self, sub_key: str, data: dict):
-        """Push a snapshot to all webapp clients watching this repo."""
+        # Push a snapshot to all webapp clients watching this repo.
         queues = self.subscribers.get(sub_key, [])
         if not queues:
             return

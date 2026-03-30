@@ -162,7 +162,6 @@ class RepoManager:
     def get_active_devs(self, owner: str, repo_name: str, branch: str, inactivity_threshold: int = 900) -> dict:
         """
         Returns active developers grouped by branch and file.
-        Filters out devs who haven't saved in inactivity_threshold seconds (default 15 min).
         """
         repo_key = owner + "/" + repo_name
         if repo_key not in self.repos:
