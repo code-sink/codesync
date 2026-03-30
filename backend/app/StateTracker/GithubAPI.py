@@ -4,7 +4,7 @@ import re
 from collections import OrderedDict
 from dataclasses import dataclass
 from .FileStates import PatchEvent
-from intervaltree import Interval
+from intervaltree import Interval, IntervalTree
 
 class LRUCache:
     def __init__(self, maxsize=1000):
@@ -95,7 +95,8 @@ class GithubAPI:
         key = (owner, repo_name, base_ref, head_ref)
 
         # 1. Fetch from GitHub (if not in shared API cache)
-        diff_map = self.branch_diffs.get(key)
+        cached = self.branch_diffs.get(key)
+        diff_map = cached[0] if cached is not None else None
 
         if not diff_map:
             url = f"https://api.github.com/repos/{owner}/{repo_name}/compare/{base_ref}...{head_ref}"
@@ -108,6 +109,8 @@ class GithubAPI:
                 return {}
 
             data = r.json()
+            ahead_by = data.get("ahead_by", 0)
+            behind_by = data.get("behind_by", 0)
             diff_map = {}
             for file_obj in data.get("files", []):
                 patch_str = file_obj.get("patch")
@@ -120,7 +123,7 @@ class GithubAPI:
                     ranges.append((start, start + length if length > 0 else start + 1))
                 diff_map[file_obj["filename"]] = ranges
             
-            self.branch_diffs.put(key, diff_map)
+            self.branch_diffs.put(key, (diff_map, ahead_by, behind_by))
         else:
             # Check if this branch is already loaded in the Repo object trees
             # If github-commit for this branch has any files, assume it's loaded.
@@ -170,3 +173,110 @@ class GithubAPI:
 
             if k in self.branch_diffs.cache:
                 del self.branch_diffs.cache[k]
+
+    def _fetch_compare(self, owner: str, repo_name: str, base_ref: str, head_ref: str, token: str = None):
+        """
+        Fetch a GitHub compare response and return (ahead_by, behind_by, diff_map).
+        diff_map: {filename -> [(start, end), ...]} in merge-base (-side) coordinates.
+        Results are cached in self.branch_diffs.
+        """
+        key = (owner, repo_name, base_ref, head_ref)
+        cached = self.branch_diffs.get(key)
+        if cached is not None:
+            # Cached entry stores: (diff_map, ahead_by, behind_by)
+            diff_map, ahead, behind = cached
+            return ahead, behind, diff_map
+
+        url = f"https://api.github.com/repos/{owner}/{repo_name}/compare/{base_ref}...{head_ref}"
+        headers = {"Accept": "application/vnd.github+json"}
+        _token = token or self.token
+        if _token:
+            headers["Authorization"] = f"Bearer {_token}"
+
+        r = requests.get(url, headers=headers)
+        if r.status_code != 200:
+            return 0, 0, {}
+
+        data = r.json()
+        ahead_by = data.get("ahead_by", 0)
+        behind_by = data.get("behind_by", 0)
+
+        diff_map = {}
+        for file_obj in data.get("files", []):
+            patch_str = file_obj.get("patch")
+            if not patch_str:
+                continue
+            ranges = []
+            for match in re.finditer(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@", patch_str, re.MULTILINE):
+                start = int(match.group(1))
+                length = int(match.group(2)) if match.group(2) else 1
+                end = start + length if length > 0 else start + 1
+                ranges.append((start, end))
+            diff_map[file_obj["filename"]] = ranges
+
+        self.branch_diffs.put(key, (diff_map, ahead_by, behind_by))
+        return ahead_by, behind_by, diff_map
+
+    def get_two_way_diff(self, owner: str, repo_name: str, default_branch: str, feature_branch: str, token: str = None):
+        """
+        Compute the two-way diff between a feature branch and the default branch.
+
+        Both diffs are parsed using the '-' (merge-base) side of each hunk, so the
+        line ranges are in the same coordinate space and overlap detection is accurate
+        without needing to store or read any file contents.
+
+        Returns:
+            {
+                "ahead_by": int,       # commits feature is ahead of default
+                "behind_by": int,      # commits feature is behind default
+                "base_conflicts": {    # files with overlapping hunk ranges
+                    "filename": [[start, end], ...]
+                }
+            }
+        """
+        # forward: what feature has changed relative to merge-base
+        ahead_by, _, feature_ranges = self._fetch_compare(
+            owner, repo_name, default_branch, feature_branch, token
+        )
+        # reverse: what default has changed relative to merge-base
+        _, behind_by, main_ranges = self._fetch_compare(
+            owner, repo_name, feature_branch, default_branch, token
+        )
+
+        # ahead_by/behind_by may be None if results came from cache
+        ahead_by = ahead_by or 0
+        behind_by = behind_by or 0
+
+        # Find overlapping hunk ranges (merge-base coordinates -> no false positives)
+        base_conflicts = {}
+        all_files = set(feature_ranges.keys()) | set(main_ranges.keys())
+
+        for filename in all_files:
+            f_ranges = feature_ranges.get(filename, [])
+            m_ranges = main_ranges.get(filename, [])
+
+            if not f_ranges or not m_ranges:
+                continue  # one side didn't touch this file — no conflict possible
+
+            # Build a temporary interval tree from main ranges
+            main_tree = IntervalTree()
+            for start, end in m_ranges:
+                if start < end:
+                    main_tree.addi(start, end)
+
+            conflicts = []
+            for start, end in f_ranges:
+                if start >= end:
+                    continue
+                overlaps = main_tree.overlap(start, end)
+                if overlaps:
+                    conflicts.append([start, end])
+
+            if conflicts:
+                base_conflicts[filename] = conflicts
+
+        return {
+            "ahead_by": ahead_by,
+            "behind_by": behind_by,
+            "base_conflicts": base_conflicts,
+        }
