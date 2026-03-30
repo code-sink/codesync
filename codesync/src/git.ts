@@ -97,16 +97,16 @@ export async function computeDiff(
 
         const repo = git.repositories.find((r: any) => r.rootUri.fsPath === repoPath);
         if (!repo) {
-            console.warn('DEBUG: computeDiff - Repo path mismatch:', repoPath);
+            console.warn('DEBUG: computeDiff, Repo path mismatch:', repoPath);
             return null;
         }
 
-        // Handle both relative and absolute paths safely
+        // this is to handle both relative and absolute paths
         const absolutePath = filePath.startsWith('/') || filePath.includes(':')
             ? vscode.Uri.file(filePath)
             : vscode.Uri.file(`${repoPath}/${filePath}`);
 
-        console.log('DEBUG: computeDiff - Computing diff for:', absolutePath.fsPath);
+        console.log('DEBUG: computeDiff, Computing diff for:', absolutePath.fsPath);
         const diff = await repo.diffWithHEAD(absolutePath.fsPath);
 
         return diff || null;

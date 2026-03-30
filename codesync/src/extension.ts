@@ -77,15 +77,17 @@ export async function activate(context: vscode.ExtensionContext) {
             repoName = parsed.repoName;
             currentBranch = repo.branch;
 
+            await socketClient.connect(token, owner, repoName, repo.branch)
+            
             // Send initial branch update to register with backend
             console.log('DEBUG: Sending initial branch_update for', owner, '/', repoName);
             socketClient.sendBranchUpdate(
                 devId,
                 owner,
                 repoName,
-                '', // No old branch
+                '', // removed old branch arg
                 repo.branch,
-                '', // No old hash
+                '', // removed old hash arg
                 baseCommitHash
             );
 
@@ -94,7 +96,6 @@ export async function activate(context: vscode.ExtensionContext) {
                 await syncRepositoryState(repo.path, owner, repoName, repo.branch, baseCommitHash);
             }
 
-            await socketClient.connect(token, owner, repoName, repo.branch)
             const watcher = new FileWatcher(async (event) => {
                 console.log('DEBUG: FileWatcher event:', event.type, 'Path:', event.filePath, 'BaseHash:', baseCommitHash);
 
