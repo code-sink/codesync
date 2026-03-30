@@ -23,4 +23,11 @@ export const getRepoDetails = async (repoId, branchId = null) => {
     return response.data;
 };
 
+export const getBranchHealth = async (repoId, branchName) => {
+    const response = await api.get(`/user/repos/${repoId}/branch-health`, {
+        params: { branch_name: branchName },
+    });
+    return response.data;
+};
+
 export default api;

@@ -381,3 +381,96 @@ def test_no_conflict_with_self_committed():
     
     # Should NOT be a conflict (filtered out because it's the same branch's committed code)
     assert result["conflict"] is False
+
+# ---------------------------------------------------------------------------
+# Tests for GithubAPI.get_two_way_diff
+# ---------------------------------------------------------------------------
+
+class MockResponse:
+    def __init__(self, status_code, data):
+        self._data = data
+        self.status_code = status_code
+    def json(self):
+        return self._data
+
+def _make_compare_data(ahead_by, behind_by, files):
+    """Build a minimal GitHub compare API response."""
+    return {
+        "ahead_by": ahead_by,
+        "behind_by": behind_by,
+        "files": [
+            {
+                "filename": fname,
+                "patch": patch,
+            }
+            for fname, patch in files.items()
+        ],
+    }
+
+def _hunk(orig_start, orig_len, new_start, new_len):
+    return f"@@ -{orig_start},{orig_len} +{new_start},{new_len} @@\n context\n"
+
+def test_two_way_diff_no_conflicts(monkeypatch):
+    """Two branches changed different files / lines — no base conflicts."""
+    api = GithubAPI()
+
+    responses = [
+        # forward: main...feature (feature added lines 10-15 in feature.py)
+        MockResponse(200, _make_compare_data(3, 0, {"feature.py": _hunk(10, 5, 10, 8)})),
+        # reverse: feature...main (main added lines 50-60 in main.py — different file)
+        MockResponse(200, _make_compare_data(0, 3, {"main.py": _hunk(50, 10, 50, 12)})),
+    ]
+    call_count = [0]
+
+    def fake_get(url, headers):
+        resp = responses[call_count[0]]
+        call_count[0] += 1
+        return resp
+
+    monkeypatch.setattr("app.StateTracker.GithubAPI.requests.get", fake_get)
+
+    result = api.get_two_way_diff("acme", "myapp", "main", "feature")
+    assert result["ahead_by"] == 3
+    assert result["behind_by"] == 3
+    assert result["base_conflicts"] == {}
+
+def test_two_way_diff_detects_conflict(monkeypatch):
+    """Same file, overlapping hunk ranges in merge-base coords → conflict."""
+    api = GithubAPI()
+
+    responses = [
+        # forward: main...feature (feature changed lines 10-20 in auth.py)
+        MockResponse(200, _make_compare_data(2, 0, {"auth.py": _hunk(10, 10, 10, 12)})),
+        # reverse: feature...main  (main changed lines 15-25 in auth.py — overlaps!)
+        MockResponse(200, _make_compare_data(0, 4, {"auth.py": _hunk(15, 10, 15, 9)})),
+    ]
+    call_count = [0]
+
+    def fake_get(url, headers):
+        resp = responses[call_count[0]]
+        call_count[0] += 1
+        return resp
+
+    monkeypatch.setattr("app.StateTracker.GithubAPI.requests.get", fake_get)
+
+    result = api.get_two_way_diff("acme", "myapp", "main", "feature")
+    assert result["base_conflicts"] != {}
+    assert "auth.py" in result["base_conflicts"]
+
+def test_two_way_diff_cache_prevents_refetch(monkeypatch):
+    """Second call to get_two_way_diff uses cache; no extra HTTP requests fired."""
+    api = GithubAPI()
+    call_count = [0]
+
+    def fake_get(url, headers):
+        call_count[0] += 1
+        return MockResponse(200, _make_compare_data(1, 1, {}))
+
+    monkeypatch.setattr("app.StateTracker.GithubAPI.requests.get", fake_get)
+
+    api.get_two_way_diff("acme", "myapp", "main", "feature")
+    assert call_count[0] == 2  # one per direction
+
+    api.get_two_way_diff("acme", "myapp", "main", "feature")
+    assert call_count[0] == 2  # still 2 — both were cached
+

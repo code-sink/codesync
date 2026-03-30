@@ -6,7 +6,7 @@ UserAccess = Table(
     "UserAccess",
     Base.metadata,
     Column("user_id", Integer, ForeignKey("User.user_id"), primary_key=True),
-    Column("repo_id", Integer, ForeignKey("Repository.repository_id"), primary_key=True),
+    Column("repository_id", Integer, ForeignKey("Repository.repository_id"), primary_key=True),
 )
 
 class User(Base):
