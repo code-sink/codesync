@@ -209,7 +209,7 @@ async def get_branch_health(repo_id: int, request: Request, branch_name: str = N
 
     from app.StateTracker import repo_manager
     try:
-        result = repo_manager.github_api.get_two_way_diff(
+        result = await repo_manager.github_api.get_two_way_diff(
             owner=owner,
             repo_name=repo_name,
             default_branch=default_branch,
@@ -220,40 +220,38 @@ async def get_branch_health(repo_id: int, request: Request, branch_name: str = N
         logger.error(f"branch-health fetch failed for {owner}/{repo_name} branch={branch_name}: {e}")
         raise HTTPException(status_code=502, detail="Failed to fetch branch diff from GitHub")
 
-    # Find uncommitted live conflicts using RepoManager's in-memory state
+    # Find uncommitted live conflicts using RepoManager's in-memory state.
+    #
+    # We report at the FILE level rather than line level because the feature branch
+    # and the default branch have different HEAD commits (and therefore different
+    # coordinate systems for their diffWithHEAD patches). Comparing line numbers
+    # directly across branches would produce false positives / false negatives.
+    # Exact line-level committed conflicts are already captured in `base_conflicts`
+    # above (via get_two_way_diff, which normalises both sides to merge-base coords).
     uncommitted_conflicts = {}
     repo_obj = repo_manager.repos.get(repo.repo_name)
     if repo_obj:
-        from collections import defaultdict
-        from intervaltree import IntervalTree
-        
-        # 1. Gather all LIVE (uncommitted) intervals for feature_branch
-        feature_live = defaultdict(IntervalTree)
-        for dev_id, branches in repo_obj.dev_intervals.items():
-            if dev_id == "github-commit": continue
-            if branch_name in branches:
-                for path, intervals in branches[branch_name].items():
-                    for ival in intervals:
-                        feature_live[path].addi(ival.begin, ival.end, ival.data)
+        # Files being live-edited on the feature branch (non-empty interval sets only)
+        feature_live_files = {
+            path
+            for dev_id, branches in repo_obj.dev_intervals.items()
+            if branch_name in branches
+            for path, intervals in branches[branch_name].items()
+            if intervals
+        }
 
-        # 2. Gather ALL intervals (commits + live) for default_branch
-        default_all = defaultdict(IntervalTree)
-        for dev_id, branches in repo_obj.dev_intervals.items():
-            if default_branch in branches:
-                for path, intervals in branches[default_branch].items():
-                    for ival in intervals:
-                        default_all[path].addi(ival.begin, ival.end, ival.data)
+        # Files being live-edited on the default branch
+        default_live_files = {
+            path
+            for dev_id, branches in repo_obj.dev_intervals.items()
+            if default_branch in branches
+            for path, intervals in branches[default_branch].items()
+            if intervals
+        }
 
-        # 3. Find overlaps
-        for path, f_tree in feature_live.items():
-            if path in default_all:
-                m_tree = default_all[path]
-                overlaps = []
-                for f_ival in f_tree:
-                    if m_tree.overlap(f_ival.begin, f_ival.end):
-                        overlaps.append([f_ival.begin, f_ival.end])
-                if overlaps:
-                    uncommitted_conflicts[path] = overlaps
+        # Files that both sides are actively editing right now
+        for path in feature_live_files & default_live_files:
+            uncommitted_conflicts[path] = []  # file-level flag; no line detail
 
     return {
         "is_default": False,
