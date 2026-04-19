@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from .StateTracker.RepoManager import RepoManager
@@ -36,6 +37,23 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     await create_all_tables()
+    asyncio.create_task(sync_inactive_repos_task())
+
+async def sync_inactive_repos_task():
+    """Background task that saves inactive repositories to the database."""
+    from app.db.db import AsyncSessionLocal
+    while True:
+        try:
+            # 5 minutes threshold
+            inactive_repos = await repo_manager.get_inactive_dirty_repos(threshold_seconds=3)
+            for repo_name in inactive_repos:
+                async with AsyncSessionLocal() as db:
+                    await repo_manager.save_repo_to_db(db, repo_name)
+                    print(f"DEBUG: Saved inactive repo '{repo_name}' to DB.")
+        except Exception as e:
+            print(f"Error in sync_inactive_repos_task: {e}")
+        
+        await asyncio.sleep(60)
 
 
 app.include_router(auth.router)
@@ -123,10 +141,8 @@ async def developer_updates(websocket: WebSocket, user=Depends(get_current_user_
     except WebSocketDisconnect:
         dev_id = connected_dev_id[0]
         print(f"WebSocket disconnected: {dev_id}")
-        if dev_id:
-            # Remove all live intervals for this dev so the tree doesn't
-            # accumulate phantom entries from developers who have closed their editor.
-            repo_manager.clear_all_dev_intervals(dev_id)
+        # Not clearing dev intervals here so they can be saved by the inactivity 
+        # task and persist as uncommitted conflicts.
 
 
 async def handle_patch_update(websocket: WebSocket, msg: dict, connected_dev_id: list):

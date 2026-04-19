@@ -38,8 +38,13 @@ PATCH_BOB_LINE2_CONFLICT = """\
 """
 
 
+class MockResult:
+    def all(self): return []
+    def scalar_one_or_none(self): return None
+
 class MockDB:
-    pass
+    async def execute(self, stmt):
+        return MockResult()
 
 
 class MockGithubAPI:

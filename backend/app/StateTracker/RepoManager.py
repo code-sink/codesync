@@ -1,3 +1,8 @@
+import time
+import json
+import datetime
+from sqlalchemy import select, delete
+from app.db.models.models import Edit, File as DBFile, Branch as DBBranch, Repository as DBRepo, User as DBUser
 from .FileStates import PatchEvent
 from .GithubAPI import GithubAPI, File
 from collections import defaultdict
@@ -20,6 +25,10 @@ class Repo:
         self.default_branch = None
         # dev_id -> branch -> file_path -> set of Interval objects
         self.dev_intervals = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
+        
+        self.last_activity = time.time()
+        self.is_dirty = False
+        self.is_loaded_from_db = False
 
     def clear_dev_branch(self, dev_id: str, branch_name: str):
         """Remove all live intervals for a dev on a specific branch from the shared trees."""
@@ -34,6 +43,122 @@ class RepoManager:
     def __init__(self):
         self.repos = defaultdict(Repo)
         self.github_api = GithubAPI()
+
+    async def get_inactive_dirty_repos(self, threshold_seconds=300):
+        """Returns a list of repo_names that haven't been touched in threshold_seconds and are dirty."""
+        now = time.time()
+        inactive = []
+        for repo_name, repo_obj in self.repos.items():
+            if repo_obj.is_dirty and (now - repo_obj.last_activity) >= threshold_seconds:
+                inactive.append(repo_name)
+        return inactive
+
+    async def _load_repo_from_db(self, db, repo_name: str):
+        repo_obj = self.repos[repo_name]
+        owner, repo_str = repo_name.split("/", 1)
+
+        stmt = (
+            select(Edit, DBFile, DBBranch, DBUser)
+            .join(DBFile, Edit.file_id == DBFile.file_id)
+            .join(DBBranch, DBFile.branch_id == DBBranch.branch_id)
+            .join(DBRepo, DBBranch.repository_id == DBRepo.repository_id)
+            .join(DBUser, Edit.user_id == DBUser.user_id)
+            .where(DBRepo.repo_name == repo_name)
+        )
+        
+        result = await db.execute(stmt)
+        rows = result.all()
+
+        for edit, db_file, db_branch, db_user in rows:
+            if edit.edit_base_commit != db_file.file_latest_commit:
+                continue
+
+            try:
+                touched_ranges = json.loads(edit.edit_ranges)
+            except Exception:
+                touched_ranges = []
+
+            patch_timestamp = edit.edit_timestamp.timestamp() if edit.edit_timestamp else time.time()
+            patch = PatchEvent(
+                dev_id=db_user.user_github_id,
+                base_commit=edit.edit_base_commit,
+                branch=db_branch.branch_name,
+                timestamp=patch_timestamp,
+                patch_text=edit.edit_patch,
+                author=db_user.user_github_login or db_user.user_github_id,
+                touched_ranges=tuple(tuple(r) for r in touched_ranges)
+            )
+
+            tree = repo_obj.files[db_file.file_path]
+            for start, end in patch.touched_ranges:
+                new_interval = Interval(start, end + 1, patch)
+                tree.add(new_interval)
+                repo_obj.dev_intervals[db_user.user_github_id][db_branch.branch_name][db_file.file_path].add(new_interval)
+
+        repo_obj.is_loaded_from_db = True
+        repo_obj.is_dirty = False
+        repo_obj.last_activity = time.time()
+
+    async def save_repo_to_db(self, db, repo_name: str):
+        repo_obj = self.repos[repo_name]
+
+        repo_stmt = select(DBRepo.repository_id).where(DBRepo.repo_name == repo_name)
+        repo_id_scalar = (await db.execute(repo_stmt)).scalar_one_or_none()
+        
+        if not repo_id_scalar:
+            return
+
+        branch_stmt = select(DBBranch.branch_id).where(DBBranch.repository_id == repo_id_scalar)
+        file_stmt = select(DBFile.file_id).where(DBFile.branch_id.in_(branch_stmt))
+        
+        del_stmt = delete(Edit).where(Edit.file_id.in_(file_stmt))
+        await db.execute(del_stmt)
+
+        all_dev_ids = list(repo_obj.dev_intervals.keys())
+        if not all_dev_ids:
+            repo_obj.is_dirty = False
+            await db.commit()
+            return
+            
+        user_stmt = select(DBUser.user_github_id, DBUser.user_id).where(DBUser.user_github_id.in_(all_dev_ids))
+        user_map = {row[0]: row[1] for row in (await db.execute(user_stmt)).all()}
+
+        branch_file_stmt = (
+            select(DBBranch.branch_name, DBFile.file_path, DBFile.file_id)
+            .join(DBFile, DBBranch.branch_id == DBFile.branch_id)
+            .where(DBBranch.repository_id == repo_id_scalar)
+        )
+        file_map = {(row[0], row[1]): row[2] for row in (await db.execute(branch_file_stmt)).all()}
+
+        new_edits = []
+        for dev_id, branches in repo_obj.dev_intervals.items():
+            user_id = user_map.get(dev_id)
+            if not user_id:
+                continue
+            
+            for branch_name, files in branches.items():
+                for file_path, intervals in files.items():
+                    file_id = file_map.get((branch_name, file_path))
+                    if not file_id or not intervals:
+                        continue
+                        
+                    sample_interval = next(iter(intervals))
+                    patch: PatchEvent = sample_interval.data
+
+                    new_edits.append(Edit(
+                        user_id=user_id,
+                        file_id=file_id,
+                        edit_timestamp=datetime.datetime.fromtimestamp(patch.timestamp),
+                        edit_patch=patch.patch_text,
+                        edit_base_commit=patch.base_commit,
+                        edit_ranges=json.dumps(patch.touched_ranges)
+                    ))
+        
+        if new_edits:
+            db.add_all(new_edits)
+            
+        await db.commit()
+        repo_obj.is_dirty = False
 
     def clear_all_dev_intervals(self, dev_id: str):
         """
@@ -71,7 +196,14 @@ class RepoManager:
            endpoint via get_two_way_diff(), which uses merge-base coordinates for both
            sides and is always accurate.
         """
-        repo = self.repos[file.owner + "/" + file.repo]
+        repo_name = file.owner + "/" + file.repo
+        repo = self.repos[repo_name]
+
+        if not repo.is_loaded_from_db:
+            await self._load_repo_from_db(db, repo_name)
+            
+        repo.last_activity = time.time()
+        repo.is_dirty = True
 
         if repo.default_branch is None:
             repo.default_branch = await self.github_api.get_default_branch(
@@ -236,3 +368,6 @@ class RepoManager:
             for ival in intervals_to_remove:
                 tree.discard(ival)
             repo.dev_intervals[dev_id][branch][file_path].clear()
+            
+        repo.last_activity = time.time()
+        repo.is_dirty = True
