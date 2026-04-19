@@ -20,6 +20,7 @@ load_dotenv()
 CLIENT_ID    = os.getenv("CLIENT_ID")
 CLIENT_SECRET= os.getenv("CLIENT_SECRET")
 FRONT_URL    = os.getenv("FRONT_URL")
+BACK_URL     = os.getenv("BACK_URL")
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -75,6 +76,7 @@ async def github_login():
         "scope=repo read:user user:email",
         f"state={nonce}",
         "allow_signup=true",
+        f"redirect_uri={BACK_URL}/auth/github/callback"
     ])
     redirect = RedirectResponse(url=f"https://github.com/login/oauth/authorize?{params}")
 

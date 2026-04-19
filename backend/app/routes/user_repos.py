@@ -23,7 +23,7 @@ async def list_repos(request: Request):
 
         result = await db.execute(
             select(Repository)
-            .join(UserAccess, Repository.repository_id == UserAccess.c.repo_id)
+            .join(UserAccess, Repository.repository_id == UserAccess.c.repository_id)
             .where(UserAccess.c.user_id == current_user.user_id)
         )
         repos = result.scalars().all()
@@ -67,7 +67,7 @@ async def get_repo_details(repo_id: int, request: Request, branch_id: int = None
         # Verify access and fetch repo
         result = await db.execute(
             select(Repository)
-            .join(UserAccess, Repository.repository_id == UserAccess.c.repo_id)
+            .join(UserAccess, Repository.repository_id == UserAccess.c.repository_id)
             .where(
                 UserAccess.c.user_id == current_user.user_id,
                 Repository.repository_id == repo_id
@@ -155,4 +155,108 @@ async def get_repo_details(repo_id: int, request: Request, branch_id: int = None
             "updated_at": selected_branch.branch_updated_at.isoformat() if selected_branch and selected_branch.branch_updated_at else None,
         },
         "files": [f.file_path for f in files]
+    }
+
+@router.get("/repos/{repo_id}/branch-health")
+async def get_branch_health(repo_id: int, request: Request, branch_name: str = None):
+    """
+    Return two-way conflict data between a feature branch and the repo's default branch.
+
+    Uses merge-base hunk coordinates from both compare directions so there are no false
+    positives from line-shift. File contents are never fetched or stored.
+
+    Returns:
+        is_default: true if branch_name is the default branch (no panel needed)
+        ahead_by, behind_by: commit distance in each direction
+        base_conflicts: {filename -> [[start, end], ...]} overlapping hunk ranges
+    """
+    current_user: User = request.state.user
+
+    async with AsyncSessionLocal() as db:
+        from sqlalchemy import select
+        from app.db.models.models import UserAccess, Repository, User as DBUser
+
+        # Verify access and fetch repo
+        result = await db.execute(
+            select(Repository)
+            .join(UserAccess, Repository.repository_id == UserAccess.c.repository_id)
+            .where(
+                UserAccess.c.user_id == current_user.user_id,
+                Repository.repository_id == repo_id
+            )
+        )
+        repo = result.scalar_one_or_none()
+        if not repo:
+            raise HTTPException(status_code=404, detail="Repository not found or access denied")
+
+        default_branch = repo.repo_default_branch or "main"
+
+        # Short-circuit for the default branch itself
+        if not branch_name or branch_name == default_branch:
+            return {"is_default": True}
+
+        # Get the user's GitHub token (needed for private repos / higher rate limits)
+        token_result = await db.execute(
+            select(DBUser.user_github_token).where(DBUser.user_id == current_user.user_id)
+        )
+        token = token_result.scalar_one_or_none()
+
+    # owner/repo extracted from "owner/repo" stored in repo_name
+    parts = repo.repo_name.split("/", 1)
+    if len(parts) != 2:
+        raise HTTPException(status_code=500, detail="Invalid repo name format in database")
+    owner, repo_name = parts
+
+    from app.StateTracker import repo_manager
+    try:
+        result = await repo_manager.github_api.get_two_way_diff(
+            owner=owner,
+            repo_name=repo_name,
+            default_branch=default_branch,
+            feature_branch=branch_name,
+            token=token,
+        )
+    except Exception as e:
+        logger.error(f"branch-health fetch failed for {owner}/{repo_name} branch={branch_name}: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch branch diff from GitHub")
+
+    # Find uncommitted live conflicts using RepoManager's in-memory state.
+    #
+    # We report at the FILE level rather than line level because the feature branch
+    # and the default branch have different HEAD commits (and therefore different
+    # coordinate systems for their diffWithHEAD patches). Comparing line numbers
+    # directly across branches would produce false positives / false negatives.
+    # Exact line-level committed conflicts are already captured in `base_conflicts`
+    # above (via get_two_way_diff, which normalises both sides to merge-base coords).
+    uncommitted_conflicts = {}
+    repo_obj = repo_manager.repos.get(repo.repo_name)
+    if repo_obj:
+        # Files being live-edited on the feature branch (non-empty interval sets only)
+        feature_live_files = {
+            path
+            for dev_id, branches in repo_obj.dev_intervals.items()
+            if branch_name in branches
+            for path, intervals in branches[branch_name].items()
+            if intervals
+        }
+
+        # Files being live-edited on the default branch
+        default_live_files = {
+            path
+            for dev_id, branches in repo_obj.dev_intervals.items()
+            if default_branch in branches
+            for path, intervals in branches[default_branch].items()
+            if intervals
+        }
+
+        # Files that both sides are actively editing right now
+        for path in feature_live_files & default_live_files:
+            uncommitted_conflicts[path] = []  # file-level flag; no line detail
+
+    return {
+        "is_default": False,
+        "default_branch": default_branch,
+        "feature_branch": branch_name,
+        **result,
+        "uncommitted_conflicts": uncommitted_conflicts,
     }

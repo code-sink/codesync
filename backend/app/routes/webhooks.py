@@ -73,10 +73,10 @@ async def _grant_access(db: AsyncSession, user_id: int, repo_id: int):
     """Insert a UserAccess row if it doesn't already exist."""
     existing = await db.execute(
         select(UserAccess)
-        .where(UserAccess.c.user_id == user_id, UserAccess.c.repo_id == repo_id)
+        .where(UserAccess.c.user_id == user_id, UserAccess.c.repository_id == repo_id)
     )
     if existing.first() is None:
-        await db.execute(UserAccess.insert().values(user_id=user_id, repo_id=repo_id))
+        await db.execute(UserAccess.insert().values(user_id=user_id, repository_id=repo_id))
 
 
 async def _onboard_single_repo(repo_data: dict, installation_id: int, token: str, grant_user_id: int | None = None):
@@ -430,7 +430,7 @@ async def _reconcile_installation(installation_id: int, token: str):
             if repo.repo_github_id not in stale_ids:
                 continue
             logger.info(f"Reconcile: removing stale repo {repo.repo_name}")
-            await db.execute(UserAccess.delete().where(UserAccess.c.repo_id == repo.repository_id))
+            await db.execute(UserAccess.delete().where(UserAccess.c.repository_id == repo.repository_id))
             branch_res = await db.execute(
                 select(Branch.branch_id).where(Branch.repository_id == repo.repository_id)
             )
@@ -480,7 +480,7 @@ async def _handle_installation_deleted(payload: dict):
             if not repo:
                 continue
 
-            await db.execute(UserAccess.delete().where(UserAccess.c.repo_id == repo.repository_id))
+            await db.execute(UserAccess.delete().where(UserAccess.c.repository_id == repo.repository_id))
 
             branch_res = await db.execute(
                 select(Branch.branch_id).where(Branch.repository_id == repo.repository_id)
@@ -519,7 +519,7 @@ async def _handle_repos_removed(payload: dict):
             if repo:
                 # Remove all access entries for this repo
                 await db.execute(
-                    UserAccess.delete().where(UserAccess.c.repo_id == repo.repository_id)
+                    UserAccess.delete().where(UserAccess.c.repository_id == repo.repository_id)
                 )
                 
                 # Find all branches for this repo
@@ -566,7 +566,7 @@ async def _handle_repos_removed(payload: dict):
             token_result = await db.execute(
                 select(User)
                 .join(UserAccess, User.user_id == UserAccess.c.user_id)
-                .join(Repository, Repository.repository_id == UserAccess.c.repo_id)
+                .join(Repository, Repository.repository_id == UserAccess.c.repository_id)
                 .where(
                     Repository.installation_id == installation_id,
                     User.user_github_token.isnot(None),
@@ -603,7 +603,7 @@ async def _handle_member_removed(payload: dict):
             await db.execute(
                 UserAccess.delete().where(
                     UserAccess.c.user_id == user.user_id,
-                    UserAccess.c.repo_id == repo.repository_id,
+                    UserAccess.c.repository_id == repo.repository_id,
                 )
             )
             logger.info(f"Removed access for user {github_user_id} from repo {repo_github_id}")
@@ -798,7 +798,7 @@ async def _handle_push(payload: dict):
             access_result = await db.execute(
                 select(User)
                 .join(UserAccess, User.user_id == UserAccess.c.user_id)
-                .where(UserAccess.c.repo_id == repo.repository_id, User.user_github_token.isnot(None))
+                .where(UserAccess.c.repository_id == repo.repository_id, User.user_github_token.isnot(None))
                 .limit(1)
             )
             fallback_user = access_result.scalar_one_or_none()

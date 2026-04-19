@@ -13,13 +13,20 @@ export const loginWithGithub = () => {
 };
 
 export const getUserRepos = async () => {
-    const response = await api.get('/user/repos');
+    const response = await api.get('user/repos');
     return response.data;
 };
 
 export const getRepoDetails = async (repoId, branchId = null) => {
     const params = branchId ? `?branch_id=${branchId}` : '';
-    const response = await api.get(`/user/repos/${repoId}${params}`);
+    const response = await api.get(`user/repos/${repoId}${params}`);
+    return response.data;
+};
+
+export const getBranchHealth = async (repoId, branchName) => {
+    const response = await api.get(`user/repos/${repoId}/branch-health`, {
+        params: { branch_name: branchName },
+    });
     return response.data;
 };
 

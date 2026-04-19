@@ -20,17 +20,20 @@ from .StateTracker import repo_manager
 app = FastAPI()
 app.add_middleware(AuthMiddleware)
 
-# Configure CORS
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+FRONT_URL = os.getenv("FRONT_URL", "http://localhost:3000")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000"
-    ],  
+    allow_origins=[FRONT_URL],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -43,13 +46,13 @@ app.include_router(webhooks.router)
 app.include_router(activity.router)
 
 @app.websocket("/developer-updates")
-async def developer_updates(websocket: WebSocket, user = Depends(get_current_user_ws)):
+async def developer_updates(websocket: WebSocket, user=Depends(get_current_user_ws)):
     """
     Single persistent WebSocket connection per developer session.
 
     Expected message format (JSON):
     {
-        "type": "patch_update" | "branch_update" | "base_commit_update",
+        "type": "patch_update" | "branch_update",
         ...type-specific fields (see below)...
     }
 
@@ -70,20 +73,21 @@ async def developer_updates(websocket: WebSocket, user = Depends(get_current_use
 
     --- branch_update ---
     Sent when the developer switches to a different branch.
-    Their uncommitted patches are migrated to the new branch.
     {
-        "type":           "branch_update",
-        "dev_id":         "alice",
-        "owner":          "acme",
-        "repo":           "myapp",
-        "old_branch":     "feature/login",
-        "new_branch":     "feature/signup",
-        "base_commit":    "abc123",
-        "new_base_commit": "def456"   // optional — if the new branch has a different tip
+        "type":            "branch_update",
+        "dev_id":          "alice",
+        "owner":           "acme",
+        "repo":            "myapp",
+        "old_branch":      "feature/login",
+        "new_branch":      "feature/signup",
+        "base_commit":     "abc123",
+        "new_base_commit": "def456"   // optional
     }
-
     """
     await websocket.accept()
+
+    # Track dev_id from the first message so we can clean up on disconnect.
+    connected_dev_id: list[str] = [None]
 
     try:
         while True:
@@ -101,36 +105,46 @@ async def developer_updates(websocket: WebSocket, user = Depends(get_current_use
 
             msg_type = msg.get("type")
             print(msg)
-            # patch_update — developer sent a code change
+
             if msg_type == "patch_update":
-                await handle_patch_update(websocket, msg)
+                await handle_patch_update(websocket, msg, connected_dev_id)
 
-            # branch_update — developer switched branches
             elif msg_type == "branch_update":
-                await handle_branch_update(websocket, msg)
+                await handle_branch_update(websocket, msg, connected_dev_id)
 
-            #unknown message type
             else:
                 await websocket.send_text(json.dumps({
                     "ok": False,
                     "error": "unknown_type",
-                    "detail": f"Unknown message type: '{msg_type}'. Expected: patch_update | branch_update"
+                    "detail": (
+                        f"Unknown message type: '{msg_type}'. "
+                        "Expected: patch_update | branch_update"
+                    )
                 }))
 
     except WebSocketDisconnect:
-        print("WebSocket disconnected")
+        dev_id = connected_dev_id[0]
+        print(f"WebSocket disconnected: {dev_id}")
+        if dev_id:
+            # Remove all live intervals for this dev so the tree doesn't
+            # accumulate phantom entries from developers who have closed their editor.
+            repo_manager.clear_all_dev_intervals(dev_id)
 
-async def handle_patch_update(websocket, msg):
+
+async def handle_patch_update(websocket: WebSocket, msg: dict, connected_dev_id: list):
     try:
         file, patch = parse_update(msg)
-    except KeyError as e:
+    except (KeyError, ValueError) as e:
         await websocket.send_text(json.dumps({
             "ok": False,
             "error": "missing_field",
             "detail": f"Required field missing: {e}"
         }))
         return
-    
+
+    # Remember this dev_id so disconnect handler can clean up their intervals.
+    connected_dev_id[0] = patch.dev_id
+
     from app.db.db import AsyncSessionLocal
     async with AsyncSessionLocal() as db:
         result = await repo_manager.patch_update(db, file, patch)
@@ -171,10 +185,10 @@ async def handle_patch_update(websocket, msg):
 
     await websocket.send_text(json.dumps(response))
 
-async def handle_branch_update(websocket, msg):
+
+async def handle_branch_update(websocket: WebSocket, msg: dict, connected_dev_id: list):
     print(f"DEBUG: Received branch_update: {msg}")
     try:
-        # Extract fields first
         dev_id = msg["dev_id"]
         owner = msg["owner"]
         repo_name = msg["repo"]
@@ -190,7 +204,7 @@ async def handle_branch_update(websocket, msg):
             "detail": f"Required field missing: {e}"
         }))
         return
-    
+
     try:
         print(f"DEBUG: Executing branch_update for {owner}/{repo_name}: {old_branch} -> {new_branch}")
         repo_manager.branch_update(
@@ -202,14 +216,18 @@ async def handle_branch_update(websocket, msg):
             base_commit=base_commit,
             new_base_commit=new_base_commit,
         )
+
+        # Remember dev_id in case this is the first message we receive from them.
+        connected_dev_id[0] = dev_id
+
         await websocket.send_text(json.dumps({
             "ok": True,
             "type": "branch_update",
         }))
         print("DEBUG: branch_update SUCCESS")
     except Exception as e:
-         print(f"DEBUG: branch_update error: {e}")
-         await websocket.send_text(json.dumps({
+        print(f"DEBUG: branch_update error: {e}")
+        await websocket.send_text(json.dumps({
             "ok": False,
             "error": "server_error",
             "detail": f"An error occurred while updating branch: {str(e)}"

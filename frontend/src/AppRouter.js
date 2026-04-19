@@ -2,16 +2,16 @@ import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import App from './App';
 import api from './api';
-import ReposPage from './components/ReposPage';
-import ConnectRepoPage from './components/ConnectRepoPage';
-import RepoDetailsPage from './components/RepoDetailsPage';
-import RootPage from './components/RootPage';
+import ReposPage from './pages/ReposPage';
+import ConnectRepoPage from './pages/ConnectRepoPage';
+import RepoDetailsPage from './pages/RepoDetailsPage';
+import RootPage from './pages/RootPage';
 
 const PrivateRoute = ({ children }) => {
     const [isLoggedIn, setIsLoggedIn] = React.useState(null);
 
     React.useEffect(() => {
-        api.get('/user/repos')
+        api.get('user/repos')
             .then(() => setIsLoggedIn(true))
             .catch(() => setIsLoggedIn(false));
     }, []);
