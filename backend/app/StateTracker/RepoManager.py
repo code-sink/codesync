@@ -369,11 +369,9 @@ class RepoManager:
             for ival in intervals_to_remove:
                 tree.discard(ival)
             repo.dev_intervals[dev_id][branch][file_path].clear()
-<<<<<<< HEAD
             
         repo.last_activity = time.time()
         repo.is_dirty = True
-=======
     
     def get_active_devs(self, owner: str, repo_name: str, branch: str, inactivity_threshold: int = 900) -> dict:
         """
@@ -403,4 +401,3 @@ class RepoManager:
                 })
 
         return result
->>>>>>> backend-sse
