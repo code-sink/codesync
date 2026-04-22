@@ -809,7 +809,8 @@ const RepoDetailsPage = () => {
         };
 
         return () => eventSource.close(); // cleanup on unmount
-    }, [repoData]);
+    }, [repoData, repoId]);
+
     useEffect(() => {
         setLoading(true);
         getRepoDetails(repoId, branchParam)
