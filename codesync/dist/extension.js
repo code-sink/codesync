@@ -689,8 +689,16 @@ class SocketClient {
         switch (msg.type) {
             case 'patch_update':
                 if (msg.conflict) {
-                    vscode.window.showWarningMessage(`CodeSync: Conflict detected — another developer has overlapping changes.`);
-                    console.log('Conflicting patches:', msg.conflicting_patches);
+                    const lines = msg.conflicting_dev_lines?.join(', ') || 'unknown';
+                    vscode.window.showWarningMessage(`CodeSync: Conflict detected — another developer is editing overlapping lines (${lines}).`);
+                    console.log('Conflicting lines:', msg.conflicting_dev_lines);
+                }
+                if (msg.cross_branch_live_files && msg.cross_branch_live_files.length > 0) {
+                    const files = msg.cross_branch_live_files.join(', ');
+                    vscode.window.showWarningMessage(`CodeSync: A developer on the main branch is also editing: ${files}`);
+                }
+                if (msg.outdated) {
+                    vscode.window.showWarningMessage(`CodeSync: Your local changes are outdated. Please pull the latest changes.`);
                 }
                 break;
             case 'branch_update':
